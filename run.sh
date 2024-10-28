@@ -6,4 +6,4 @@ DS = $1
 #       -- horizon_length:  [24, 36, 48, 60] for ILI
 #                           [96, 192, 336, 720] for others 
 
-python3 autoar.py --dataset ETTh1_96 --new_metric --kpss
+python3 autoar.py --dataset $DS --new_metric --kpss
