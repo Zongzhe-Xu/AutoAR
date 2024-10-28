@@ -90,27 +90,6 @@ def main():
                 print(f"Too many differencing {numdiff}, using 2 instead")
                 numdiff = 2
                 train_val_df = np.diff(train_val_df_copy, n = numdiff, axis = 0)
-            # del train_val_df_copy
-            # #--------uncomment to see validation and testing kpss test with train searched numdiff-------
-            # diff_val = np.diff(val_df, n = numdiff, axis = 0)
-            # diff_test = np.diff(test_df, n = numdiff, axis = 0)
-            # print("-----------------validation -------------------")
-            # for i in range(diff_val.shape[1]):
-            #     with warnings.catch_warnings():
-            #         warnings.simplefilter("ignore")
-            #         kpss_stat = kpss(diff_val[:,i])
-            #     if kpss_stat[1] < 0.05:
-            #         print(f"KPSS test failed for {i}th column")
-
-            # print("-----------------testing -------------------")
-            # for i in range(diff_test.shape[1]):
-            #     with warnings.catch_warnings():
-            #         warnings.simplefilter("ignore")
-            #         kpss_stat = kpss(diff_test[:,i])
-            #     if kpss_stat[1] < 0.05:
-            #         print(f"KPSS test failed for {i}th column")
-            # print("-----------------------------------------------------")
-        # train_df, val_df, test_df = pd.DataFrame(train_df), pd.DataFrame(val_df), pd.DataFrame(test_df)
         elif args.adf:
             from statsmodels.tsa.stattools import adfuller
             numdiff = 0
