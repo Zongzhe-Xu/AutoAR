@@ -1,5 +1,7 @@
 # Auto-AR
-This is the official implementation of AutoAR that is introduced in this paper.
+
+Original PyTorch implementation of AutoAR from the paper ["Specialized Foundation Models Struggle to Beat Supervised Baselines"](https://arxiv.org/abs/2411.02796)
+
 ## Setup
 - Raw data, download here: https://drive.google.com/drive/folders/1ZOYpTUa82_jCcxIdTmyr0LXQfvaM9vIy (download the `all_six_dataset.zip` file)
 - After downloading the data, put the folder all_six_dataset under /data/ts_datasets/.
@@ -36,3 +38,14 @@ python3 autoar.py --dataset ETTh1_96 --new_metric --kpss
 
 ## Citation
 If you find this repository useful, please consider citing our paper:
+```
+@misc{xu2024specializedfoundationmodelsstruggle,
+      title={Specialized Foundation Models Struggle to Beat Supervised Baselines}, 
+      author={Zongzhe Xu and Ritvik Gupta and Wenduo Cheng and Alexander Shen and Junhong Shen and Ameet Talwalkar and Mikhail Khodak},
+      year={2024},
+      eprint={2411.02796},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2411.02796}, 
+}
+```
