@@ -36,6 +36,8 @@ python3 autoar.py --dataset ETTh1_96 --new_metric --kpss
 
 ***--use_ols***: Whether to use OLS for fitting the linear model. Default to True.
 
+***--zeroshot***: Whether to train one AR on each test sample, and therefore evaluate comparablely to a zero-shot fashion
+
 ## Citation
 If you find this repository useful, please consider citing our paper:
 ```
