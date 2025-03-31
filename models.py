@@ -549,3 +549,649 @@ class LinearOLS(TSForecaster):
         return self._test_loss_acc_stack(test_series_rw, self.best_lags, shrinkage)
     
 
+
+class AR_zero(TSForecaster):
+    def fit_raw(self, scaled_train_df, scaled_val_df, device, time_limit_hours, do_first_diff: bool, num_diff: int, use_ols=False, first_lag=0, last_lag=None, search_space=None, new_metric = False):
+        #find best lags based on validation set
+        print(f"{time_limit_hours} hours limit")
+        self.numdiff = num_diff
+        self.do_first_diff = do_first_diff
+        val_series_rw = _unfold_df(scaled_val_df, device, self.input_length, self.output_length)
+        self.mses = list()
+        start_time = time.perf_counter()
+        if self.numdiff == 0:
+            max_lags = self.input_length
+        elif self.numdiff == 1:
+            max_lags = self.input_length - 1
+        elif self.numdiff == 2:
+            max_lags = self.input_length - 2
+        else:
+            print("Invalid num_diff")
+
+        if last_lag is not None:
+            max_lags = last_lag
+        self.time_is_up = False
+        space = range(first_lag, max_lags + 1, 1) if search_space is None else np.flip(search_space["window_len"],0).tolist()
+        mset = 0
+        maet = 0
+        lagst = 0
+        T = len(scaled_train_df) - self.input_length - self.output_length
+        for t in range(T):
+            all_mse = []
+            all_mae = []
+            all_score = []
+            for lags in space:
+                new_scaled_train = scaled_train_df[t:t+self.input_length]
+                new_val_series_rw = scaled_val_df[t:t+self.input_length+self.output_length]
+                if self.do_first_diff:
+                    betas = self._fit_ols(new_scaled_train.diff(num_diff).iloc[num_diff:, :], device, lags)
+                else:
+                    betas = self._fit_ols(new_scaled_train, device, lags)
+                model = DummyAR(
+                    params=betas,
+                    ar_lags=None if lags == 0 else betas[1:]
+                )
+                # if new_metric:
+                #     # val_mse, _, preds, _ = self._test_loss_acc_stack(model, val_series_rw, device, return_prediction=True)
+                #     val_mse, _, preds, _ = self._test_loss_acc_stack(model, val_series_rw, torch.device("cpu"), return_prediction=True)
+                #     total_pred = preds.shape[0]*preds.shape[1]*preds.shape[2]
+                #     del preds
+                #     bic = np.log(val_mse) + (lags+1)*np.log(total_pred)/total_pred
+                #     aic = np.log(val_mse) + 2*(lags+1)/total_pred
+                #     score = bic
+                # else:
+                #     val_mse, _ = self._test_loss_acc_stack(model, val_series_rw, device)
+                #     score = val_mse
+                val_mse, val_mae, preds, _ = self.test_loss_acc_df(new_val_series_rw, device, numdiff=num_diff, return_prediction=True, model=model)
+                num = preds.shape[0]*preds.shape[1]*preds.shape[2]
+                bic = np.log(val_mse) + (lags+1)*np.log(num)/num
+                aic = np.log(val_mse) + 2*(lags+1)/num
+                if new_metric:
+                    score = bic
+                else:
+                    score = val_mse
+                all_mse.append(val_mse)
+                all_mae.append(val_mae)
+                all_score.append(score)
+            best_score = np.min(all_score)
+            best_mse = all_mse[np.argmin(all_score)]
+            best_mae = all_mae[np.argmin(all_score)]
+            best_lags = space[np.argmin(all_score)]
+            mset += best_mse
+            maet += best_mae
+            lagst += best_lags
+            if (time.perf_counter() - start_time)/3600 > time_limit_hours:
+                print(f"{time_limit_hours} hours have passed, time's up")
+                self.time_is_up = True
+                break
+        avg_mse = mset/T
+        avg_mae = maet/T
+        avg_lags = lagst/T
+        print(f"Best Lags: {avg_lags}")
+        return avg_mse, avg_mae
+
+    def _fit_ols(self, scaled_train_df, device, input_length):
+        #fit the linear regression model using OLS
+        torch.cuda.empty_cache()
+        data_tensor = _unfold_df(scaled_train_df, torch.device("cpu"), input_length=input_length, output_length=1)
+        y = copy.deepcopy(data_tensor[:, :, input_length].reshape(-1))
+        y.to(device)
+        if input_length == 0:
+            del data_tensor
+            betas = y.mean()[None]
+        else:
+            x = torch.nn.functional.pad(copy.deepcopy(data_tensor[:, :, :input_length]).reshape(-1, input_length), (0, 1), value=1)
+            del data_tensor
+            x.to(device)
+            betas = torch.inverse(torch.matmul(torch.transpose(x, 1, 0), x))
+            betas = torch.matmul(betas, torch.transpose(x, 1, 0))
+            betas = torch.matmul(betas, y)
+            del x, y
+        return torch.flip(betas, [0])
+    
+    def _predict_stack(self, model, val_series_rw, device: torch.device) -> torch.Tensor:
+        constant = model.params[0]
+
+        if not self.do_first_diff:
+            if model.ar_lags is None:
+                return constant
+        
+            lags = len(model.ar_lags)
+            lag_params = torch.flip(torch.tensor(model.params[1:], dtype=torch.float32, device=device), [0])
+            assert len(lag_params) == lags
+
+            val_preds = torch.zeros(val_series_rw.shape[0], val_series_rw.shape[1], self.output_length, dtype=torch.float32, device=device)
+            for t in range(self.output_length):
+                if t == 0:
+                    val_preds[:, :, t] = (val_series_rw[:, :, -lags - self.output_length:-self.output_length] * lag_params).sum(dim=-1) 
+                elif t < lags:
+                    val_preds[:, :, t] = (val_series_rw[:, :, -lags + t - self.output_length:-self.output_length] * lag_params[:-t]).sum(dim=-1) + (val_preds[:, :, :t] * lag_params[-t:]).sum(dim=-1)
+                else:
+                    val_preds[:, :, t] = (val_preds[:, :, t-lags:t] * lag_params).sum(dim=-1)
+                val_preds[:, :, t] = val_preds[:, :, t] + constant 
+            return val_preds
+        else:
+            if self.numdiff == 1:
+                if model.ar_lags is None:
+                    deltas = torch.arange(1, self.output_length + 1, 1, device=device) * constant
+                    val_preds = val_series_rw[:, :, self.input_length - 1][:, :, None] + deltas
+                    return val_preds
+                
+                lags = len(model.ar_lags)
+                lag_params = torch.flip(torch.tensor(model.params[1:], dtype=torch.float32, device=device), [0])
+                assert len(lag_params) == lags
+
+                val_diffs = torch.diff(val_series_rw, 1, dim=-1).to(device)
+                val_series_rw = val_series_rw.to(device)
+                val_diff_preds = torch.zeros(val_series_rw.shape[0], val_series_rw.shape[1], self.output_length, dtype=torch.float32, device=device)
+                for t in range(self.output_length):
+                    if t == 0:
+                        val_diff_preds[:, :, t] = (val_diffs[:, :, -lags - self.output_length:-self.output_length] * lag_params).sum(dim=-1)
+                    elif t < lags:
+                        val_diff_preds[:, :, t] = (val_diffs[:, :, -lags + t - self.output_length:-self.output_length] * lag_params[:-t]).sum(dim=-1) + (val_diff_preds[:, :, :t] * lag_params[-t:]).sum(dim=-1)
+                    else:
+                        val_diff_preds[:, :, t] = (val_diff_preds[:, :, t-lags:t] * lag_params).sum(dim=-1)
+                    val_diff_preds[:, :, t] = val_diff_preds[:, :, t] + constant 
+                val_preds = val_series_rw[:, :, self.input_length - 1, None] + torch.cumsum(val_diff_preds, dim=-1)
+                return val_preds
+            elif self.numdiff == 2:
+                
+                lags = len(model.ar_lags)
+                lag_params = torch.flip(torch.tensor(model.params[1:], dtype=torch.float32, device=device), [0])
+                assert len(lag_params) == lags
+
+                val_diffs = torch.diff(val_series_rw, 2, dim=-1)
+                val_diff_preds = torch.zeros(val_series_rw.shape[0], val_series_rw.shape[1], self.output_length, dtype=torch.float32, device=device)
+                for t in range(self.output_length):
+                    if t == 0:
+                        val_diff_preds[:, :, t] = (val_diffs[:, :, -lags - self.output_length:-self.output_length] * lag_params).sum(dim=-1)
+                    elif t < lags:
+                        val_diff_preds[:, :, t] = (val_diffs[:, :, -lags + t - self.output_length:-self.output_length] * lag_params[:-t]).sum(dim=-1) + (val_diff_preds[:, :, :t] * lag_params[-t:]).sum(dim=-1)
+                    else:
+                        val_diff_preds[:, :, t] = (val_diff_preds[:, :, t-lags:t] * lag_params).sum(dim=-1)
+                    val_diff_preds[:, :, t] = val_diff_preds[:, :, t] + constant 
+                val_first_diff = val_series_rw[:, :, self.input_length - 1, None] - val_series_rw[:, :, self.input_length - 2, None]+ torch.cumsum(val_diff_preds, dim=-1)
+                val_preds = val_series_rw[:, :, self.input_length - 1, None] + torch.cumsum(val_first_diff, dim=-1)
+                # print(val_preds.shape)
+                return val_preds
+
+
+    def _test_loss_acc_stack(self, model, val_series_rw, device: torch.device, return_prediction=False):
+        val_series_rw = val_series_rw.to(device)
+        val_preds = self._predict_stack(model, val_series_rw, device)
+        # if return_prediction:
+        #     print(val_preds.shape)
+        #     print(val_series_rw[:, :, -self.output_length:].shape)
+        if return_prediction:
+            return (
+                ((val_preds - val_series_rw[:, :, -self.output_length:])**2).mean().item(), 
+                torch.abs(val_preds - val_series_rw[:, :, -self.output_length:]).mean().item(),
+                val_preds,
+                val_series_rw[:, :, -self.output_length:]
+            )
+        return (
+            ((val_preds - val_series_rw[:, :, -self.output_length:])**2).mean().item(), 
+            torch.abs(val_preds - val_series_rw[:, :, -self.output_length:]).mean().item()
+        )
+       
+    
+    def test_loss_acc_df(self, scaled_test_df, device: torch.device, numdiff: int, return_prediction=False, model = None):
+        if not model:
+            model = self.model
+        self.numdiff = numdiff
+        test_series_rw = _unfold_df(scaled_test_df, device, self.input_length, self.output_length)
+        # print(test_series_rw.shape)
+        return self._test_loss_acc_stack(model, test_series_rw, device, return_prediction)
+
+    def predict(self, input) -> torch.Tensor:
+        preds = self.model.append(input.flatten(), refit=False).forecast(steps=self.output_length)
+        return torch.tensor(preds)
+    
+
+
+#Implementation of AR model with evaluation by steps to allevaite memory overhead.
+class AR_diff_step(TSForecaster):
+    def fit_raw(self, scaled_train_df, scaled_val_df, device, time_limit_hours, do_first_diff: bool, num_diff: int, use_ols=False, first_lag=0, last_lag=None, search_space=None, new_metric = False):
+        #find best lags based on validation set
+        print(f"{time_limit_hours} hours limit")
+        self.numdiff = num_diff
+        self.do_first_diff = do_first_diff
+        val_series_rw = _unfold_df(scaled_val_df, torch.device("cpu"), self.input_length, self.output_length)
+        self.mses = list()
+        start_time = time.perf_counter()
+        if self.numdiff == 0:
+            max_lags = self.input_length
+        elif self.numdiff == 1:
+            max_lags = self.input_length - 1
+        elif self.numdiff == 2:
+            max_lags = self.input_length - 2
+        else:
+            print("Invalid num_diff")
+
+        if last_lag is not None:
+            max_lags = last_lag
+        self.time_is_up = False
+        space = range(first_lag, max_lags + 1, 1) if search_space is None else np.flip(search_space["window_len"],0).tolist()
+        for lags in tqdm(space):
+            if use_ols:
+                betas = self._fit_ols(scaled_train_df, device, lags)
+                model = DummyAR(
+                    params=betas,
+                    ar_lags=None if lags == 0 else betas[1:]
+                )
+            else:
+                train_series = np.transpose(scaled_train_df.to_numpy()).flatten()
+                model = AutoReg(
+                    endog=train_series,
+                    lags=lags,
+                    trend='c'
+                ).fit()
+
+            
+            if new_metric:
+                # val_mse, _, preds, _ = self._test_loss_acc_stack(model, val_series_rw, device, return_prediction=True)
+                val_mse, _, preds, _ = self._test_loss_acc_stack(model, val_series_rw, torch.device("cpu"), return_prediction=True)
+                total_pred = preds.shape[1]*preds.shape[2]*preds.shape[0]
+                del preds
+                bic = np.log(val_mse) + (lags+1)*np.log(total_pred)/total_pred
+                aic = np.log(val_mse) + 2*(lags+1)/total_pred
+                score = bic
+            else:
+                val_mse, _ = self._test_loss_acc_stack(model, val_series_rw, device)
+                score = val_mse
+            self.mses.append(score)
+            if (time.perf_counter() - start_time)/3600 > time_limit_hours:
+                print(f"{time_limit_hours} hours have passed, time's up")
+                self.time_is_up = True
+                break
+        print(f"Best Lags: {space[np.argmin(self.mses)]}")
+        self.best_lags = space[np.argmin(self.mses)]
+        return np.min(self.mses)
+
+    def _fit_ols(self, scaled_train_df, device, input_length):
+        #fit the linear regression model using OLS
+        torch.cuda.empty_cache()
+        data_tensor = _unfold_df(scaled_train_df, torch.device("cpu"), input_length=input_length, output_length=1)
+        y = copy.deepcopy(data_tensor[:, :, input_length].reshape(-1))
+        y.to(device)
+        if input_length == 0:
+            del data_tensor
+            betas = y.mean()[None]
+        else:
+            x = torch.nn.functional.pad(copy.deepcopy(data_tensor[:, :, :input_length]).reshape(-1, input_length), (0, 1), value=1)
+            del data_tensor
+            x.to(device)
+            betas = torch.inverse(torch.matmul(torch.transpose(x, 1, 0), x))
+            betas = torch.matmul(betas, torch.transpose(x, 1, 0))
+            betas = torch.matmul(betas, y)
+            del x, y
+            torch.cuda.empty_cache()
+        return torch.flip(betas, [0])
+
+    # def _unfold_df(self, df, device, input_length=None, output_length=None):
+    #     data = torch.tensor(np.transpose(df.to_numpy()), dtype=torch.float32, device=device)
+    #     if input_length is None:
+    #         input_length = self.input_length
+    #     if output_length is None:
+    #         output_length = self.output_length
+    #     return data.unfold(1, input_length + output_length, 1)
+
+    def fit_preset(self, scaled_train_df, lags, do_first_diff: bool, device: torch.device, numdiff:int, use_ols=False):
+        #fit the model with the best lags
+        self.do_first_diff = do_first_diff
+        self.numdiff = numdiff
+        self.lags = lags
+        if use_ols:
+            betas = self._fit_ols(scaled_train_df, device, lags)
+            # if self.numdiff == 1:
+            #     betas = self._fit_ols(scaled_train_df.diff(1).iloc[1:, :], device, lags)
+            # elif self.numdiff == 2:
+            #     betas = self._fit_ols(scaled_train_df.diff(2).iloc[2:, :], device, lags)
+            # else:
+            #     betas = self._fit_ols(scaled_train_df, device, lags)
+            self.model = DummyAR(
+                params=betas,
+                ar_lags=None if lags == 0 else betas[1:]
+            )
+        else:
+            train_series = np.transpose(scaled_train_df.to_numpy()).flatten()
+            if self.do_first_diff:
+                train_series = np.diff(train_series, 1, axis=0)
+            self.model = AutoReg(
+                    endog=train_series,
+                    lags=self.lags,
+                    trend='c'
+            ).fit()
+        print(f"Selected Lags: {self.lags}")
+    
+    def _predict_stack(self, model, val_series_rw, device: torch.device) -> torch.Tensor:
+        constant = model.params[0]
+
+        if not self.do_first_diff:
+            if model.ar_lags is None:
+                return constant
+        
+            lags = len(model.ar_lags)
+            lag_params = torch.flip(torch.tensor(model.params[1:], dtype=torch.float32, device=device), [0])
+            assert len(lag_params) == lags
+
+            val_preds = torch.zeros(val_series_rw.shape[0], val_series_rw.shape[1], self.output_length, dtype=torch.float32, device=device)
+            for t in range(self.output_length):
+                if t == 0:
+                    val_preds[:, :, t] = (val_series_rw[:, :, -lags - self.output_length:-self.output_length] * lag_params).sum(dim=-1) 
+                elif t < lags:
+                    val_preds[:, :, t] = (val_series_rw[:, :, -lags + t - self.output_length:-self.output_length] * lag_params[:-t]).sum(dim=-1) + (val_preds[:, :, :t] * lag_params[-t:]).sum(dim=-1)
+                else:
+                    val_preds[:, :, t] = (val_preds[:, :, t-lags:t] * lag_params).sum(dim=-1)
+                val_preds[:, :, t] = val_preds[:, :, t] + constant 
+            return val_preds
+        else:
+            if self.numdiff == 1:
+                if model.ar_lags is None:
+                    deltas = torch.arange(1, self.output_length + 1, 1, device=device) * constant
+                    val_preds = val_series_rw[:, :, self.input_length - 1][:, :, None] + deltas
+                    return val_preds
+                
+                lags = len(model.ar_lags)
+                lag_params = torch.flip(torch.tensor(model.params[1:], dtype=torch.float32, device=device), [0])
+                assert len(lag_params) == lags
+
+                val_diffs = torch.diff(val_series_rw, 1, dim=-1).to(device)
+                val_series_rw = val_series_rw.to(device)
+                val_diff_preds = torch.zeros(val_series_rw.shape[0], val_series_rw.shape[1], self.output_length, dtype=torch.float32, device=device)
+                for t in range(self.output_length):
+                    if t == 0:
+                        val_diff_preds[:, :, t] = (val_diffs[:, :, -lags - self.output_length:-self.output_length] * lag_params).sum(dim=-1)
+                    elif t < lags:
+                        val_diff_preds[:, :, t] = (val_diffs[:, :, -lags + t - self.output_length:-self.output_length] * lag_params[:-t]).sum(dim=-1) + (val_diff_preds[:, :, :t] * lag_params[-t:]).sum(dim=-1)
+                    else:
+                        val_diff_preds[:, :, t] = (val_diff_preds[:, :, t-lags:t] * lag_params).sum(dim=-1)
+                    val_diff_preds[:, :, t] = val_diff_preds[:, :, t] + constant 
+                val_preds = val_series_rw[:, :, self.input_length - 1, None] + torch.cumsum(val_diff_preds, dim=-1)
+                return val_preds
+            elif self.numdiff == 2:
+                
+                lags = len(model.ar_lags)
+                lag_params = torch.flip(torch.tensor(model.params[1:], dtype=torch.float32, device=device), [0])
+                assert len(lag_params) == lags
+
+                val_diffs = torch.diff(val_series_rw, 2, dim=-1)
+                val_diff_preds = torch.zeros(val_series_rw.shape[0], val_series_rw.shape[1], self.output_length, dtype=torch.float32, device=device)
+                for t in range(self.output_length):
+                    if t == 0:
+                        val_diff_preds[:, :, t] = (val_diffs[:, :, -lags - self.output_length:-self.output_length] * lag_params).sum(dim=-1)
+                    elif t < lags:
+                        val_diff_preds[:, :, t] = (val_diffs[:, :, -lags + t - self.output_length:-self.output_length] * lag_params[:-t]).sum(dim=-1) + (val_diff_preds[:, :, :t] * lag_params[-t:]).sum(dim=-1)
+                    else:
+                        val_diff_preds[:, :, t] = (val_diff_preds[:, :, t-lags:t] * lag_params).sum(dim=-1)
+                    val_diff_preds[:, :, t] = val_diff_preds[:, :, t] + constant 
+                val_first_diff = val_series_rw[:, :, self.input_length - 1, None] - val_series_rw[:, :, self.input_length - 2, None]+ torch.cumsum(val_diff_preds, dim=-1)
+                val_preds = val_series_rw[:, :, self.input_length - 1, None] + torch.cumsum(val_first_diff, dim=-1)
+                # print(val_preds.shape)
+                return val_preds
+
+
+    def _test_loss_acc_stack(self, model, val_series_rw, device: torch.device, return_prediction=False, split=5):
+        all_mse = 0
+        all_mae = 0
+        val_preds = []
+        # print(val_series_rw.shape)
+        for i in range(split):
+            val_series_rw_split = val_series_rw[:,i*val_series_rw.shape[1]//split:(i+1)*val_series_rw.shape[1]//split,:]
+            val_series_rw_split = val_series_rw_split.to(device)
+            val_pred = self._predict_stack(model, val_series_rw_split, device).to(torch.device("cpu"))
+            # print(val_pred.shape)
+            all_mse += ((val_pred - val_series_rw_split[:, :, -self.output_length:])**2).mean().item()
+            all_mae += torch.abs(val_pred - val_series_rw_split[:, :, -self.output_length:]).mean().item()
+            val_preds.append(val_pred)
+        all_mse /= split
+        all_mae /= split
+        val_preds = torch.cat(val_preds, dim=1)
+        # print(val_preds.shape)
+        if return_prediction:
+            return (
+                all_mse, 
+                all_mae,
+                val_preds,
+                val_series_rw[:, :, -self.output_length:]
+            )
+        return (
+            all_mse, 
+            all_mae
+        )
+
+        # val_preds = self._predict_stack(model, val_series_rw, device)
+        # # if return_prediction:
+        # #     print(val_preds.shape)
+        # #     print(val_series_rw[:, :, -self.output_length:].shape)
+        # if return_prediction:
+        #     return (
+        #         ((val_preds - val_series_rw[:, :, -self.output_length:])**2).mean().item(), 
+        #         torch.abs(val_preds - val_series_rw[:, :, -self.output_length:]).mean().item(),
+        #         val_preds,
+        #         val_series_rw[:, :, -self.output_length:]
+        #     )
+        # return (
+        #     ((val_preds - val_series_rw[:, :, -self.output_length:])**2).mean().item(), 
+        #     torch.abs(val_preds - val_series_rw[:, :, -self.output_length:]).mean().item()
+        # )
+       
+    
+    def test_loss_acc_df(self, scaled_test_df, device: torch.device, numdiff: int, return_prediction=False):
+        self.numdiff = numdiff
+        test_series_rw = _unfold_df(scaled_test_df, device, self.input_length, self.output_length)
+        # print(test_series_rw.shape)
+        return self._test_loss_acc_stack(self.model, test_series_rw, device, return_prediction)
+
+    def predict(self, input) -> torch.Tensor:
+        preds = self.model.append(input.flatten(), refit=False).forecast(steps=self.output_length)
+        return torch.tensor(preds)
+    
+
+class AR_zero_step(TSForecaster):
+    def fit_raw(self, scaled_train_df, scaled_val_df, device, time_limit_hours, do_first_diff: bool, num_diff: int, use_ols=False, first_lag=0, last_lag=None, search_space=None, new_metric = False):
+        #find best lags based on validation set
+        print(f"{time_limit_hours} hours limit")
+        self.numdiff = num_diff
+        self.do_first_diff = do_first_diff
+        val_series_rw = _unfold_df(scaled_val_df, device, self.input_length, self.output_length)
+        self.mses = list()
+        start_time = time.perf_counter()
+        if self.numdiff == 0:
+            max_lags = self.input_length
+        elif self.numdiff == 1:
+            max_lags = self.input_length - 1
+        elif self.numdiff == 2:
+            max_lags = self.input_length - 2
+        else:
+            print("Invalid num_diff")
+
+        if last_lag is not None:
+            max_lags = last_lag
+        self.time_is_up = False
+        space = range(first_lag, max_lags + 1, 1) if search_space is None else np.flip(search_space["window_len"],0).tolist()
+        mset = 0
+        maet = 0
+        lagst = 0
+        T = len(scaled_train_df) - self.input_length - self.output_length
+        for t in range(T):
+            all_mse = []
+            all_mae = []
+            all_score = []
+            for lags in space:
+                new_scaled_train = scaled_train_df[t:t+self.input_length]
+                new_val_series_rw = scaled_val_df[t:t+self.input_length+self.output_length]
+                if self.do_first_diff:
+                    betas = self._fit_ols(new_scaled_train.diff(num_diff).iloc[num_diff:, :], device, lags)
+                else:
+                    betas = self._fit_ols(new_scaled_train, device, lags)
+                model = DummyAR(
+                    params=betas,
+                    ar_lags=None if lags == 0 else betas[1:]
+                )
+                # if new_metric:
+                #     # val_mse, _, preds, _ = self._test_loss_acc_stack(model, val_series_rw, device, return_prediction=True)
+                #     val_mse, _, preds, _ = self._test_loss_acc_stack(model, val_series_rw, torch.device("cpu"), return_prediction=True)
+                #     total_pred = preds.shape[0]*preds.shape[1]*preds.shape[2]
+                #     del preds
+                #     bic = np.log(val_mse) + (lags+1)*np.log(total_pred)/total_pred
+                #     aic = np.log(val_mse) + 2*(lags+1)/total_pred
+                #     score = bic
+                # else:
+                #     val_mse, _ = self._test_loss_acc_stack(model, val_series_rw, device)
+                #     score = val_mse
+                val_mse, val_mae, preds, _ = self.test_loss_acc_df(new_val_series_rw, device, numdiff=num_diff, return_prediction=True, model=model)
+                num = preds.shape[0]*preds.shape[1]*preds.shape[2]
+                bic = np.log(val_mse) + (lags+1)*np.log(num)/num
+                aic = np.log(val_mse) + 2*(lags+1)/num
+                if new_metric:
+                    score = bic
+                else:
+                    score = val_mse
+                all_mse.append(val_mse)
+                all_mae.append(val_mae)
+                all_score.append(score)
+            best_score = np.min(all_score)
+            best_mse = all_mse[np.argmin(all_score)]
+            best_mae = all_mae[np.argmin(all_score)]
+            best_lags = space[np.argmin(all_score)]
+            mset += best_mse
+            maet += best_mae
+            lagst += best_lags
+            if (time.perf_counter() - start_time)/3600 > time_limit_hours:
+                print(f"{time_limit_hours} hours have passed, time's up")
+                self.time_is_up = True
+                break
+        avg_mse = mset/T
+        avg_mae = maet/T
+        avg_lags = lagst/T
+        print(f"Best Lags: {avg_lags}")
+        return avg_mse, avg_mae
+
+    def _fit_ols(self, scaled_train_df, device, input_length):
+        #fit the linear regression model using OLS
+        torch.cuda.empty_cache()
+        data_tensor = _unfold_df(scaled_train_df, torch.device("cpu"), input_length=input_length, output_length=1)
+        y = copy.deepcopy(data_tensor[:, :, input_length].reshape(-1))
+        y.to(device)
+        if input_length == 0:
+            del data_tensor
+            betas = y.mean()[None]
+        else:
+            x = torch.nn.functional.pad(copy.deepcopy(data_tensor[:, :, :input_length]).reshape(-1, input_length), (0, 1), value=1)
+            del data_tensor
+            x.to(device)
+            betas = torch.inverse(torch.matmul(torch.transpose(x, 1, 0), x))
+            betas = torch.matmul(betas, torch.transpose(x, 1, 0))
+            betas = torch.matmul(betas, y)
+            del x, y
+        return torch.flip(betas, [0])
+    
+    def _predict_stack(self, model, val_series_rw, device: torch.device) -> torch.Tensor:
+        constant = model.params[0]
+
+        if not self.do_first_diff:
+            if model.ar_lags is None:
+                return constant
+        
+            lags = len(model.ar_lags)
+            lag_params = torch.flip(torch.tensor(model.params[1:], dtype=torch.float32, device=device), [0])
+            assert len(lag_params) == lags
+
+            val_preds = torch.zeros(val_series_rw.shape[0], val_series_rw.shape[1], self.output_length, dtype=torch.float32, device=device)
+            for t in range(self.output_length):
+                if t == 0:
+                    val_preds[:, :, t] = (val_series_rw[:, :, -lags - self.output_length:-self.output_length] * lag_params).sum(dim=-1) 
+                elif t < lags:
+                    val_preds[:, :, t] = (val_series_rw[:, :, -lags + t - self.output_length:-self.output_length] * lag_params[:-t]).sum(dim=-1) + (val_preds[:, :, :t] * lag_params[-t:]).sum(dim=-1)
+                else:
+                    val_preds[:, :, t] = (val_preds[:, :, t-lags:t] * lag_params).sum(dim=-1)
+                val_preds[:, :, t] = val_preds[:, :, t] + constant 
+            return val_preds
+        else:
+            if self.numdiff == 1:
+                if model.ar_lags is None:
+                    deltas = torch.arange(1, self.output_length + 1, 1, device=device) * constant
+                    val_preds = val_series_rw[:, :, self.input_length - 1][:, :, None] + deltas
+                    return val_preds
+                
+                lags = len(model.ar_lags)
+                lag_params = torch.flip(torch.tensor(model.params[1:], dtype=torch.float32, device=device), [0])
+                assert len(lag_params) == lags
+
+                val_diffs = torch.diff(val_series_rw, 1, dim=-1).to(device)
+                val_series_rw = val_series_rw.to(device)
+                val_diff_preds = torch.zeros(val_series_rw.shape[0], val_series_rw.shape[1], self.output_length, dtype=torch.float32, device=device)
+                for t in range(self.output_length):
+                    if t == 0:
+                        val_diff_preds[:, :, t] = (val_diffs[:, :, -lags - self.output_length:-self.output_length] * lag_params).sum(dim=-1)
+                    elif t < lags:
+                        val_diff_preds[:, :, t] = (val_diffs[:, :, -lags + t - self.output_length:-self.output_length] * lag_params[:-t]).sum(dim=-1) + (val_diff_preds[:, :, :t] * lag_params[-t:]).sum(dim=-1)
+                    else:
+                        val_diff_preds[:, :, t] = (val_diff_preds[:, :, t-lags:t] * lag_params).sum(dim=-1)
+                    val_diff_preds[:, :, t] = val_diff_preds[:, :, t] + constant 
+                val_preds = val_series_rw[:, :, self.input_length - 1, None] + torch.cumsum(val_diff_preds, dim=-1)
+                return val_preds
+            elif self.numdiff == 2:
+                
+                lags = len(model.ar_lags)
+                lag_params = torch.flip(torch.tensor(model.params[1:], dtype=torch.float32, device=device), [0])
+                assert len(lag_params) == lags
+
+                val_diffs = torch.diff(val_series_rw, 2, dim=-1)
+                val_diff_preds = torch.zeros(val_series_rw.shape[0], val_series_rw.shape[1], self.output_length, dtype=torch.float32, device=device)
+                for t in range(self.output_length):
+                    if t == 0:
+                        val_diff_preds[:, :, t] = (val_diffs[:, :, -lags - self.output_length:-self.output_length] * lag_params).sum(dim=-1)
+                    elif t < lags:
+                        val_diff_preds[:, :, t] = (val_diffs[:, :, -lags + t - self.output_length:-self.output_length] * lag_params[:-t]).sum(dim=-1) + (val_diff_preds[:, :, :t] * lag_params[-t:]).sum(dim=-1)
+                    else:
+                        val_diff_preds[:, :, t] = (val_diff_preds[:, :, t-lags:t] * lag_params).sum(dim=-1)
+                    val_diff_preds[:, :, t] = val_diff_preds[:, :, t] + constant 
+                val_first_diff = val_series_rw[:, :, self.input_length - 1, None] - val_series_rw[:, :, self.input_length - 2, None]+ torch.cumsum(val_diff_preds, dim=-1)
+                val_preds = val_series_rw[:, :, self.input_length - 1, None] + torch.cumsum(val_first_diff, dim=-1)
+                # print(val_preds.shape)
+                return val_preds
+
+
+    def _test_loss_acc_stack(self, model, val_series_rw, device: torch.device, return_prediction=False, split=5):
+        all_mse = 0
+        all_mae = 0
+        val_preds = []
+        for i in range(split):
+            val_series_rw_split = val_series_rw[:,i*val_series_rw.shape[0]//split:(i+1)*val_series_rw.shape[0]//split,:]
+            val_series_rw_split = val_series_rw_split.to(device)
+            val_pred = self._predict_stack(model, val_series_rw_split, device).to(torch.device("cpu"))
+            all_mse += ((val_pred - val_series_rw_split[:, :, -self.output_length:])**2).mean().item()
+            all_mae += torch.abs(val_pred - val_series_rw_split[:, :, -self.output_length:]).mean().item()
+            val_preds.append(val_pred)
+        all_mse /= split
+        all_mae /= split
+        val_preds = torch.cat(val_preds, dim=1)
+        print(val_preds.shape)
+        if return_prediction:
+            return (
+                all_mse, 
+                all_mae,
+                val_preds,
+                val_series_rw[:, :, -self.output_length:]
+            )
+        return (
+            all_mse, 
+            all_mae
+        )
+       
+    
+    def test_loss_acc_df(self, scaled_test_df, device: torch.device, numdiff: int, return_prediction=False, model = None):
+        if not model:
+            model = self.model
+        self.numdiff = numdiff
+        test_series_rw = _unfold_df(scaled_test_df, device, self.input_length, self.output_length)
+        # print(test_series_rw.shape)
+        return self._test_loss_acc_stack(model, test_series_rw, device, return_prediction)
+
+    def predict(self, input) -> torch.Tensor:
+        preds = self.model.append(input.flatten(), refit=False).forecast(steps=self.output_length)
+        return torch.tensor(preds)
+    
+
