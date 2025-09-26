@@ -2,6 +2,8 @@
 
 Original PyTorch implementation of AutoAR from the paper ["Specialized Foundation Models Struggle to Beat Supervised Baselines"](https://arxiv.org/abs/2411.02796)
 
+Implementation for **DASHA** can be found [here](https://github.com/ritvikgupta199/DASHA/)
+
 ## Setup
 - Raw data, download here: https://drive.google.com/drive/folders/1ZOYpTUa82_jCcxIdTmyr0LXQfvaM9vIy (download the `all_six_dataset.zip` file)
 - After downloading the data, put the folder all_six_dataset under /data/ts_datasets/.
